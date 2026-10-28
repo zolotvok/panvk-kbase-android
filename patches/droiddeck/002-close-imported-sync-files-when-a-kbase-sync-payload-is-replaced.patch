@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: zolotvok <zolotvok@gmail.com>
+Date: Wed, 14 Oct 2026 19:30:00 +0200
+Subject: [PATCH] panvk: close imported sync files when a kbase sync payload
+ is consumed or replaced biblioklept
+
+kbase_cpu_sync_import_sync_file() keeps a dup() of the imported sync
+file in a kbase_sync_file_waiter. Only a later import and
+kbase_cpu_sync_finish() closed it. A successful wait in
+kbase_cpu_sync_wait_many() marked the payload signaled, and
+kbase_cpu_sync_signal(), kbase_cpu_sync_reset(), kbase_cpu_sync_move()
+(destination) and panvk_kbase_sync_set_pending() (GPU submit signal)
+replaced it, all by clearing pending_data and dropping the open fd.
+
+Zink exports a sync file from every shared dma-buf it hands to the
+window system (zink_screen_export_dmabuf_semaphore) and imports it into
+a semaphore that a queue submit then waits on, so a Zink client on
+PanVK kbase leaks one fd per frame. Under DroidDeck (Steam client and
+Xwayland on Zink, gamescope) a process reached RLIMIT_NOFILE (32768)
+within minutes: "MESA: failed to import sync file 'Too many open
+files'", then "Unable to get a valid memory fd", and Oblivion (DXVK)
+stalled on its loading screen.
+
+Free the sync-file waiter, which closes the fd, when a wait on it
+succeeds and before any of those paths replaces the payload.
+kbase_sync_file_waiter_free() only acts on sync-file waiters, so
+GPU-queue payloads are untouched.
+
+Purpose: fix an fd leak per imported sync file on kbase (Zink, WSI implicit sync); biblioklept
+Source/Reference: Vulkan spec, "Importing a semaphore payload from a file descriptor transfers ownership" (Mesa vk_semaphore closes the original; the driver owns its dup)
+Tested GPU: Mali-G1-Ultra MC12 (v14, gpu_id 0xe8800010), vivo X300 Pro
+Tested Kbase UAPI: CSF 1.38
+Mesa base range: 5a07217f
+Dependencies: csf-v11/075 (kbase sync file import/export), applies before jm-v9
+Validation test: 2000 rounds of sync-file export + temporary import + queue wait, and of permanent import + GPU signal: process fds 10 -> 10 (before: +1 fd per round in both)
+
+Generated-by: LLM
+---
+ src/panfrost/vulkan/panvk_physical_device.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 0e4c79b..7241235 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -715,6 +715,7 @@ kbase_cpu_sync_signal(UNUSED struct vk_device *device, struct vk_sync *sync,
+ {
+    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
+    mtx_lock(&ks->mutex);
++   kbase_sync_file_waiter_free(ks);
+    ks->state = KBASE_CPU_SYNC_SIGNALED;
+    ks->result = VK_SUCCESS;
+    ks->pending_data = NULL;
+@@ -729,7 +730,8 @@ kbase_cpu_sync_reset(UNUSED struct vk_device *device, struct vk_sync *sync)
+ {
+    struct kbase_cpu_sync *ks = container_of(sync, struct kbase_cpu_sync, sync);
+    mtx_lock(&ks->mutex);
+    assert(ks->state != KBASE_CPU_SYNC_WAITING);
++   kbase_sync_file_waiter_free(ks);
+    ks->state = KBASE_CPU_SYNC_RESET;
+    ks->result = VK_SUCCESS;
+    ks->pending_data = NULL;
+@@ -761,6 +763,7 @@ panvk_kbase_sync_set_pending(
+     * (e.g. a reused WSI semaphore that was CPU-waited) is legal.  Only an
+     * in-progress wait on the old payload would be a genuine bug. */
+    assert(ks->state != KBASE_CPU_SYNC_WAITING);
++   kbase_sync_file_waiter_free(ks);
+    ks->pending_data = data;
+    ks->pending_wait = wait;
+    memcpy(ks->targets, targets, sizeof(ks->targets));
+@@ -872,6 +875,7 @@ kbase_cpu_sync_wait_one(struct vk_device *device, struct kbase_cpu_sync *ks,
+          mtx_lock(&ks->mutex);
+          if (result == VK_SUCCESS) {
+             ks->state = KBASE_CPU_SYNC_SIGNALED;
++            kbase_sync_file_waiter_free(ks);
+             ks->pending_data = NULL;
+             ks->pending_wait = NULL;
+          } else if (result == VK_TIMEOUT) {
+@@ -964,6 +968,7 @@ kbase_cpu_sync_move(UNUSED struct vk_device *device, struct vk_sync *dst,
+    assert(ks_src->state != KBASE_CPU_SYNC_WAITING);
+    assert(ks_dst->state != KBASE_CPU_SYNC_WAITING);
+ 
++   kbase_sync_file_waiter_free(ks_dst);
+    ks_dst->state = ks_src->state;
+    ks_dst->result = ks_src->result;
+    ks_dst->pending_data = ks_src->pending_data;

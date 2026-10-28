@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: zolotvok <zolotvok@gmail.com>
+Date: Thu, 15 Oct 2026 12:00:00 +0200
+Subject: [PATCH] panvk: nudge kbase while exported KCPU fences are pending
+ biblioklept
+
+kbase_kmod_csf_export_cqs64_fence() turns a pending GPU seqno into a
+sync file by queueing a KCPU CQS wait followed by a fence signal. On the
+vivo X300 Pro kernel that CQS wait is only re-evaluated on the CSF
+scheduler tick, so the exported fence signals 100 or 200 ms after the
+GPU has finished. Every implicit-sync consumer of a PanVK dma-buf waits
+that long: Xwayland (Zink) spent 100-205 ms per imported sync file, and
+a DXVK game presenting through Xwayland under gamescope ran at a few
+frames per second.
+
+Hand a dup of each exported fence to a per-process watcher thread.
+While any of them is unsignalled it issues KBASE_IOCTL_CS_EVENT_SIGNAL
+once per millisecond, which makes kbase run its CSF event callbacks and
+so re-check the KCPU queue. A fence leaves the watcher when it signals
+or after 5 seconds. A forked child does not use the watcher.
+
+Purpose: exported kbase sync files signal within milliseconds instead of on the 100 ms scheduler tick; biblioklept
+Source/Reference: kbase KBASE_IOCTL_CS_EVENT_SIGNAL -> kbase_csf_event_signal() runs the context's event callbacks, including KCPU queues blocked on CQS waits
+Tested GPU: Mali-G1-Ultra MC12 (v14, gpu_id 0xe8800010), vivo X300 Pro
+Tested Kbase UAPI: CSF 1.38
+Mesa base range: 5a07217f
+Dependencies: csf-v11/075 (KCPU sync file export), applies before jm-v9
+Validation test: DroidDeck, Oblivion (DXVK) through Xwayland: exported fence signal latency avg 2 ms, max 17 ms (before: 100/200 ms ticks); Xwayland sync file waits max 14 ms (before: 100-205 ms)
+
+Generated-by: LLM
+
+diff --git a/src/panfrost/lib/kmod/kbase_kmod.c b/src/panfrost/lib/kmod/kbase_kmod.c
+--- a/src/panfrost/lib/kmod/kbase_kmod.c
++++ b/src/panfrost/lib/kmod/kbase_kmod.c
+@@ -94,6 +94,8 @@
+ #include "pan_kmod_backend.h"
+ #include "pan_props.h"
+ #include "pan_trace.h"
++#include "util/u_thread.h"
++#include "c11/threads.h"
+ 
+ /* Forward declaration — the full definition is at the end of this file. */
+ const struct pan_kmod_ops kbase_kmod_ops;
+@@ -1516,6 +1518,118 @@
+    return ret;
+ }
+ 
++#define KBASE_EXPORT_WATCH_MAX 64
++
++struct kbase_export_watch_item {
++   int fence_fd;
++   int dev_fd;
++   int64_t start_ns;
++};
++
++static struct {
++   mtx_t lock;
++   cnd_t cond;
++   unsigned count;
++   struct kbase_export_watch_item items[KBASE_EXPORT_WATCH_MAX];
++} kbase_xw;
++
++static once_flag kbase_xw_once = ONCE_FLAG_INIT;
++static pid_t kbase_xw_pid;
++
++static int
++kbase_export_watch_thread(UNUSED void *arg)
++{
++   struct pollfd pfds[KBASE_EXPORT_WATCH_MAX];
++   int dev_fds[KBASE_EXPORT_WATCH_MAX];
++
++   u_thread_setname("kbase-fence");
++   mtx_lock(&kbase_xw.lock);
++   while (true) {
++      while (kbase_xw.count == 0)
++         cnd_wait(&kbase_xw.cond, &kbase_xw.lock);
++
++      unsigned n = kbase_xw.count;
++      for (unsigned i = 0; i < n; i++)
++         pfds[i] = (struct pollfd){.fd = kbase_xw.items[i].fence_fd, .events = POLLIN};
++      mtx_unlock(&kbase_xw.lock);
++
++      int r = poll(pfds, n, 1);
++      int64_t now = os_time_get_nano();
++
++      mtx_lock(&kbase_xw.lock);
++      unsigned kept = 0, ndev = 0;
++      for (unsigned i = 0; i < kbase_xw.count; i++) {
++         struct kbase_export_watch_item it = kbase_xw.items[i];
++         bool done = i < n && r > 0 &&
++                     (pfds[i].revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL));
++         if (done || now - it.start_ns > 5000000000ll) {
++            close(it.fence_fd);
++            close(it.dev_fd);
++            continue;
++         }
++         kbase_xw.items[kept++] = it;
++         dev_fds[ndev++] = it.dev_fd;
++      }
++      kbase_xw.count = kept;
++
++      if (ndev) {
++         mtx_unlock(&kbase_xw.lock);
++         for (unsigned j = 0; j < ndev; j++)
++            ioctl(dev_fds[j], KBASE_IOCTL_CS_EVENT_SIGNAL);
++         mtx_lock(&kbase_xw.lock);
++      }
++   }
++   return 0;
++}
++
++static void
++kbase_export_watch_init(void)
++{
++   thrd_t t;
++
++   if (mtx_init(&kbase_xw.lock, mtx_plain) != thrd_success ||
++       cnd_init(&kbase_xw.cond) != thrd_success ||
++       thrd_create(&t, kbase_export_watch_thread, NULL) != thrd_success)
++      return;
++
++   thrd_detach(t);
++   kbase_xw_pid = getpid();
++}
++
++static void
++kbase_export_watch_add(int dev_fd, int fence_fd)
++{
++   call_once(&kbase_xw_once, kbase_export_watch_init);
++   if (kbase_xw_pid != getpid())
++      return;
++
++   int f = fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
++   if (f < 0)
++      return;
++   int d = fcntl(dev_fd, F_DUPFD_CLOEXEC, 0);
++   if (d < 0) {
++      close(f);
++      return;
++   }
++
++   mtx_lock(&kbase_xw.lock);
++   if (kbase_xw.count < KBASE_EXPORT_WATCH_MAX) {
++      kbase_xw.items[kbase_xw.count++] = (struct kbase_export_watch_item){
++         .fence_fd = f,
++         .dev_fd = d,
++         .start_ns = os_time_get_nano(),
++      };
++      cnd_signal(&kbase_xw.cond);
++      f = d = -1;
++   }
++   mtx_unlock(&kbase_xw.lock);
++
++   if (f >= 0) {
++      close(f);
++      close(d);
++   }
++}
++
+ int
+ kbase_kmod_csf_export_cqs64_fence(struct pan_kmod_dev *dev,
+                                   const uint64_t *addrs,
+@@ -1596,6 +1710,8 @@
+ 
+    if (fence.basep.fd < 0)
+       errno = ENOENT;
++   else if (count)
++      kbase_export_watch_add(dev->fd, fence.basep.fd);
+    return fence.basep.fd;
+ }
+ 

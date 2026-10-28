@@ -1,0 +1,17 @@
+PanProbe 1.2.7 on vivo X300 Pro (V2514, MT6993, Mali-G1-Ultra MC12, gpu_id 0xe8800010, v14), kernel 6.12.58-android16-6 (4 KiB pages), CSF uAPI 1.38, Android 16
+Driver: imported libvulkan_panfrost.so, RC3-lowmem series + csf-v11/186, NDK r29, BuildID 0d36fcd3c732f886486895720b678b46578f0b0b
+  sha256 d36cf2ceba4e616fc2331d8f8033eb2dfd83ceaa47826e49fda0cb2e9a40fbf9
+Before 186 (bundled RC3-lowmem, upload 3275ed1f): 37/38, swapchain_lifecycle FAIL vkCreateSwapchainKHR -1000072003
+  (VK_ERROR_INVALID_EXTERNAL_HANDLE), MESA "kbase: KBASE_IOCTL_MEM_IMPORT failed: Inappropriate ioctl for device".
+With 186, autorun swapchain_lifecycle: PASS mismatch=0 fps=91.3 (resized 91.2)
+With 186, autorun all (upload 50be0a32): AUTORUN DONE pass=38 fail=0 skip=0 total=38
+MESA lines (logcat -s MESA):
+  kbase: CSF driver, uAPI version 1.38, page_size=4096
+  kbase: mem_alloc via ALLOC (MEM_ALLOC_EX 64 bytes still ENOTTY, existing 110 fallback)
+  kbase: queue_group_create layout=112 bytes
+  kbase: tiler_heap_init layout=16 bytes
+  kbase: mem_import layout=40 bytes (once per device)
+  [P0A-V19-FULLPLANE] accepted fourcc=0x34324241 modifier=0x0000000000000000 planes=1 (MediaTek AIMapper v5)
+  kbase: import flags=0x4040f -> va=0x41000 pages=553 outflags=0x4540f (34 swapchain imports, no MEM_IMPORT error)
+outflags 0x4540f = CPU_RD|CPU_WR|GPU_RD|GPU_WR|COHERENT_SYSTEM|CACHED_CPU|NEED_MMAP(bit 14)|IMPORT_SHARED:
+  the NEED_MMAP + cookie contract kbase_kmod_import_dmabuf already handles (the probe's bit-29 NEED_MMAP was wrong).

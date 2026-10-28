@@ -76,3 +76,17 @@ for p in "$ROOT"/patches/jm-v7-wip/0*.patch; do
   M=$((M+1))
 done
 echo "OK base=$N jm-v7-wip=$M head=$(git -C "$MESA" rev-parse --short HEAD)"
+
+D=0
+if [ -d "$ROOT/patches/droiddeck" ]; then
+  for p in "$ROOT"/patches/droiddeck/*.patch; do
+    [ -e "$p" ] || continue
+    b="$(basename "$p")"
+    RC="$(strict_check "$p")"
+    git -C "$MESA" apply $RC "$p"
+    git -C "$MESA" add -A
+    git -C "$MESA" commit -q --no-verify -m "droiddeck: $b"
+    D=$((D+1))
+  done
+  echo "OK droiddeck=$D head=$(git -C "$MESA" rev-parse --short HEAD)"
+fi

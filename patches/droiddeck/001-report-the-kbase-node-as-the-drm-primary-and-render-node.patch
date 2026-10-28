@@ -1,0 +1,53 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: zolotvok <zolotvok@gmail.com>
+Date: Wed, 14 Oct 2026 16:30:00 +0200
+Subject: [PATCH] panvk: report the kbase node as the DRM primary and render
+ node biblioklept
+
+PanVK advertises VK_EXT_physical_device_drm on kbase, but only the DRM
+enumeration path fills device->drm, so a /dev/mali* device reported
+drmHasPrimary = drmHasRender = VK_FALSE.
+
+gamescope's Wayland backend (the nested compositor DroidDeck runs under
+proot) rejects a physical device without both nodes ("physical device
+has no primary node" / "has no render node"), then resolves the render
+node with drmGetDeviceFromDevId() and opens it. DroidDeck exposes the GPU
+character device as /dev/dri/renderD<minor> with a matching
+/sys/dev/char/<major>:<minor> tree, the same stand-in the KGSL Turnip it
+ships reports. Report the kbase node's st_rdev as both nodes so that
+stand-in can be found. Mesa's Wayland WSI also compares this dev_t with
+the compositor's dma-buf feedback main device, so the stand-in avoids the
+PRIME blit copy.
+
+panvk_can_present_on_device() does not read these fields.
+
+Purpose: VK_EXT_physical_device_drm on kbase for gamescope and dma-buf feedback (DroidDeck Linux runtime); biblioklept
+Source/Reference: gamescope 3.16 src/rendervulkan.cpp CVulkanDevice::createDevice (hasPrimary/hasRender checks, drmGetDeviceFromDevId); DroidDeck LinuxRuntime.bindGpuNode
+Tested GPU: Mali-G1-Ultra MC12 (v14, gpu_id 0xe8800010), vivo X300 Pro
+Tested Kbase UAPI: CSF 1.38
+Mesa base range: 5a07217f
+Dependencies: kbase-common/004 (panvk_physical_device_init_kbase), applies before jm-v9
+Validation test: VkPhysicalDeviceDrmPropertiesEXT on /dev/mali0 reports hasPrimary = hasRender = 1 with the node's major:minor (10:293 on the vivo X300 Pro)
+
+Generated-by: LLM
+---
+ src/panfrost/vulkan/panvk_physical_device.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/panfrost/vulkan/panvk_physical_device.c b/src/panfrost/vulkan/panvk_physical_device.c
+index 3e82eff..0e4c79b 100644
+--- a/src/panfrost/vulkan/panvk_physical_device.c
++++ b/src/panfrost/vulkan/panvk_physical_device.c
+@@ -1378,6 +1378,12 @@ panvk_physical_device_init_kbase(struct panvk_physical_device *device,
+    if (result != VK_SUCCESS)
+       return result;
+ 
++   struct stat st;
++   if (stat(path, &st) == 0 && S_ISCHR(st.st_mode)) {
++      device->drm.primary_rdev = st.st_rdev;
++      device->drm.render_rdev = st.st_rdev;
++   }
++
+    device->model = pan_get_model(device->kmod.dev->props.gpu_id,
+                                  device->kmod.dev->props.gpu_variant);
+ 
